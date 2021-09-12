@@ -4,15 +4,21 @@
  * - Distance between sensors to detect birds instead of larger things
  */
 
-#define print(value) Serial.println(value)
-#define printStr(str) Serial.println((String)str)
+#define print(value) Serial.println((value))
+#define printStr(str, value) Serial.println((String)(str) + value)
+
+#define SENSOR 1
+#define BUZZER 1
+
+unsigned long now;
+bool calibrated;
 
 int freeRam () {
   extern int __heap_start, *__brkval; 
   int v; 
   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
 }
- 
+
 void swap(float& a, float& b){
   float t = a;
   a = b;
@@ -36,22 +42,23 @@ struct Timer {
   unsigned long durations[stateCount];
   unsigned int stateIdx;
   unsigned long startTime;
-  unsigned long nowTime;
-  bool locked;
+  unsigned long offset;
 
   template<typename... Ints>
-  Timer(Ints... durations) : durations{durations...}, stateIdx(0), startTime(0), nowTime(0), locked(false) {}
-
-  void start(){
-    startTime = now();
+  Timer(Ints... durations) : durations{durations...}, stateIdx(0), startTime(0), offset(0) {
+    for(int i = 3; i < stateCount; i++){
+      this->durations[i] = this->durations[2 - (i % 2)];
+    }
   }
 
-  bool stop(bool resetTimer=true){
-    if(!locked)nowTime = now();
-    if(startTime > nowTime){
-      start();
-    }else if(isRunning() && nowTime - startTime >= durations[stateIdx]){
-      if(resetTimer){
+  void start(){
+    startTime = 1;
+    setRemainingTime(durations[stateIdx]);
+  }
+
+  bool stop(bool modify=true){
+    if(isRunning() && nowTime() >= durations[stateIdx] + startTime){
+      if(modify){
         reset();
         stateIdx = (stateIdx + 1) % stateCount;
       }
@@ -60,9 +67,10 @@ struct Timer {
     return false;
   }
 
-  unsigned long now(){
-    auto t = millis();
-    return t <= 0 ? 1 : t; // makes sure to never return 0 (unlikely case of overflow followed by reading)
+  void setRemainingTime(unsigned long t){
+    if(durations[stateIdx] + startTime < t + now) startTime = t;
+    offset = durations[stateIdx] + startTime - t - now;
+//    printStr("REM | Running: ", (isRunning() ? "YES" : "NO") + " " + status() + " Trigger: " + (nowTime()  >= durations[stateIdx] + startTime ? "YES" : "NO") + " Now: " + nowTime() + " Start: " + startTime + " Diff: " + (nowTime() - startTime));
   }
 
   bool isRunning(){
@@ -73,14 +81,17 @@ struct Timer {
     startTime = 0;
   }
 
-  void lock(){
-    nowTime = now();
-    locked = true;
+  unsigned long nowTime(){
+    return now + offset;
   }
 
   String status(){
-    return (startTime == 0 ? (String)"Not running" : (String)"Rem: " + (durations[stateIdx] - now() + startTime) + " ms" ) + " [" + stateIdx + "]";
+    return (startTime == 0 ? (String)"Not running" : (String)"Rem: " + (durations[stateIdx] - nowTime() + startTime) + " ms" ) + " [" + stateIdx + "]";
   }
+
+  bool isLoad() { return stateIdx == 0; }
+  virtual bool isHigh() { return (stateIdx % 2) == 1; }
+  virtual bool isLow() { return stateIdx > 0 && (stateIdx % 2) == 0; }
 };
 
 struct BiTimer: public Timer<2>{
@@ -90,21 +101,13 @@ struct BiTimer: public Timer<2>{
   bool isHigh() { return stateIdx == 1; }
 };
 
-struct TriTimer: public Timer<3>{
-  template<typename... Args>
-  TriTimer(Args... args): Timer(args...){}
-  bool isLoad() { return stateIdx == 0; }
-  bool isHigh() { return stateIdx == 1; }
-  bool isLow() { return stateIdx == 2; }
-  void setLoad() { stateIdx = 0, reset(); }
-};
-
 constexpr int calPin = 6;
 BiTimer calTimer(
-  5000UL /* calibration time */,
+  600000UL /* calibration time */,
   100UL /* LED time */
 );
 
+#ifdef SENSOR
 struct USSensor{
 
   String sensorName;
@@ -114,18 +117,18 @@ struct USSensor{
   unsigned long lastTrig; // time in millis since last trig
   bool updateLastTrig; // can update lastTrig
 
-  constexpr static int sampleSize = 5; // num sample to calc median distance
+  constexpr static int sampleSize = 10; // num sample to calc median distance
   float distSample[sampleSize]; //samples for median distance calc
   int slot = 0; // index for next raw distance value in median calc
 
   constexpr static float maxDistRatio = 0.5;
   constexpr static float maxDistanceAllowed = 1000;
 
-  TriTimer triggerTimer;
+  Timer<3> triggerTimer;
 
-  USSensor(String sensorName, int trigPin, int echoPin, int detectPin):
+  USSensor(String sensorName, int trigPin, int echoPin, int detectPin, unsigned long waitTime):
     sensorName(sensorName), echoPin(echoPin), trigPin(trigPin), detectPin(detectPin),
-    triggerTimer(3000UL /* wait */, 100UL /* LED */, 5000UL /* cooldown */), updateLastTrig(true)
+    triggerTimer(waitTime /* wait */, 100UL /* LED */, 5000UL /* cooldown */), updateLastTrig(true)/* needs to callibrate first*/
     {
     pinMode(trigPin, OUTPUT); // Sets the trigPin as an OUTPUT
     pinMode(detectPin, OUTPUT); // Sets the detectPin as an OUTPUT
@@ -155,12 +158,13 @@ struct USSensor{
 
     //update max distance if its callibration time
     newMaxDist = rawDistance > newMaxDist ? rawDistance : newMaxDist;
-    // printStr(sensorName + ": " + (calTimer.stop(false) ? "STOP" : "--") + " " + (calTimer.isHigh() ? "HIGH" : "LOW"));
+    // printStr(sensorName, ": " + (calTimer.stop(false) ? "STOP" : "--") + " " + (calTimer.isHigh() ? "HIGH" : "LOW"));
     if(calTimer.stop(false) && calTimer.isHigh()){
-      printStr(sensorName + ": CALIBRATED!");
+      printStr(sensorName, ": CALIBRATED!");
       maxDist = newMaxDist * maxDistRatio;
       newMaxDist = 0;
     }
+    if(!calibrated) return;
 
     if(triggerTimer.stop()){ // timer ended: go to next stage
       if(!triggerTimer.isLoad()){ // on and cooldown
@@ -178,9 +182,9 @@ struct USSensor{
 
   void trigger(){
     if(triggerTimer.isHigh()){
-      printStr("##" + sensorName + " triggered##");
+      printStr("##", sensorName + " triggered##");
       digitalWrite(detectPin, HIGH);
-      if(updateLastTrig) lastTrig = triggerTimer.now();
+      if(updateLastTrig) lastTrig = now;
     }else if(triggerTimer.isLow()){
       digitalWrite(detectPin, LOW);
     }
@@ -199,19 +203,22 @@ struct USSensor{
 };
 
 USSensor sensors[2] = {
-  USSensor("Green", 2,3,7), //bottom
-  USSensor("Blue", 4,5,8) //top
+  USSensor("Green", 2,3,7, 3000UL /* wait time */), //top
+  USSensor("Blue", 4,5,8, 1000UL /* wait time */) //bottom
 };
+#endif
 
+#ifdef BUZZER
 struct ActiveBuzzer{
   int buzzPin;
-  TriTimer buzzTimer;
+  Timer<9> buzzTimer;
 
   constexpr static unsigned long trigGap = 5000; //ms
   ActiveBuzzer(int buzzPin):
     buzzPin(buzzPin),
-    buzzTimer(5000UL /* wait */, 20UL /* high */, 50UL /* low */){
+    buzzTimer(5000UL /* wait */, 20UL /* high */, 10UL /* low */){
     pinMode(buzzPin,OUTPUT);//initialize the buzzer pin as an output
+    digitalWrite(buzzPin,LOW);
   }
 
   void buzzTrigger(){
@@ -223,9 +230,13 @@ struct ActiveBuzzer{
     if(buzzTimer.stop()){ // timer ended: go to next stage
       if(!buzzTimer.isLoad()){ // on and cooldown
         buzzTimer.start();
+        if(buzzTimer.isHigh()){
+          buzzTrigger();
+        }else{
+          digitalWrite(buzzPin,LOW);
+        }
       }
-      buzzTrigger();
-    }else if(sensors[0].lastTrig - sensors[1].lastTrig >= trigGap){
+    }else if(sensors[0].lastTrig  >= trigGap + sensors[1].lastTrig){
       if(buzzTimer.isLoad() && !buzzTimer.isRunning()){
         buzzTimer.start();
       }
@@ -234,9 +245,14 @@ struct ActiveBuzzer{
     }
   }
 
+  String status(){
+    return (String)"Buzzer | " + sensors[0].lastTrig + " / " + (trigGap + sensors[1].lastTrig) + " ms | Timer: " + buzzTimer.status() + " - " + (buzzTimer.isLoad() ? "LOAD" : (buzzTimer.isHigh() ? "HIGH" : "LOW"));
+  }
+
 };
 
 ActiveBuzzer buzzer(9);
+#endif
 
 int totalTick;
 constexpr int tickSize = 10;
@@ -246,45 +262,58 @@ int tickIdx;
 void setup() {  
 
   Serial.begin(9600); // // Serial Communication is starting with 9600 of baudrate speed
-  Serial.println("##Start##");
+  print("##Start##");
+
+#ifdef SENSOR
+  print("Sensor Enabled");
+#endif
+
+#ifdef BUZZER
+  print("Buzzer Enabled");
+#endif
+
+  now = 1;
+  calibrated = false;
 
   totalTick = 0, tickIdx = 0;
   memset(ticks, 0, sizeof(ticks));
 
-  // printStr("CAL initializing: " + calTimer.status());
   calTimer.start();
-  // printStr("CAL initialized: " + calTimer.status());
-  
+  calTimer.setRemainingTime(2000);
 }
 
-void loop() {  
-  int loopStartTime = millis();
+void loop() {
+  // set clock
+  now = millis();
+  now += (now == 0);
 
   // print("##------------------------------##");
+  // printStr("RAM: ", freeRam());
 
-  calTimer.lock();
-
+#ifdef SENSOR
   for(auto& sensor: sensors) sensor.update();
-  sensors[0].updateLastTrig = sensors[1].distance >= sensors[0].distance;
-  printStr("Sensors: " + sensors[0].status() + " || " + sensors[1].status());
+  sensors[0].updateLastTrig = calibrated && sensors[1].distance >= sensors[0].distance;
+//  printStr("Sensors: ", sensors[0].status() + " || " + sensors[1].status());
+#endif
 
-  // buzzer.update();
+#ifdef BUZZER
+  buzzer.update();
+  print(buzzer.status());
+#endif
 
   if(calTimer.stop()){
-    
-    if(calTimer.isHigh()) printStr("##CALIBRATE##");
+    if(calTimer.isHigh()) print("##CALIBRATE##");
     digitalWrite(calPin, calTimer.isLow() ? LOW : HIGH); 
     calTimer.start();
+    calibrated = true;
   }
   else{
-    // printStr("CAL: " + calTimer.status());
+//     printStr("CAL: ", calTimer.status());
   }
 
-  calTimer.locked = false;
-
   totalTick -= ticks[tickIdx];
-  ticks[tickIdx] = millis() - loopStartTime;
+  ticks[tickIdx] = millis() - now;
   totalTick += ticks[tickIdx];
-  // printStr("Tick Time: " + (totalTick / tickSize) + " ms | raw: " + ticks[tickIdx]);
+  // printStr("Tick Time: ", (totalTick / tickSize) + " ms | raw: " + ticks[tickIdx]);
   tickIdx = (tickIdx + 1) % tickSize;
 }
