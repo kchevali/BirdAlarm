@@ -1,0 +1,6 @@
+{
+    "board": "arduino:avr:uno",
+    "programmer": "arduino:avrisp",
+    "sketch": "BirdAlarm.ino",
+    "port": "/dev/cu.usbmodem14201"
+}
